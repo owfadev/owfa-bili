@@ -96,16 +96,33 @@ def _cacheable(url: str) -> bool:
     return p in CACHEABLE_PATHS if p else False
 
 
-def _cache_key(session, url: str) -> str:
-    """Strip per-request signature params (wts/w_rid) so signed and unsigned forms collide."""
+def _normalize_query(url: str, params) -> dict:
+    """Merged query params for the cache key: URL query string + requests params kwarg,
+    with per-request signature params (wts/w_rid) stripped so signed and unsigned
+    forms of the same call collide."""
     base, _, query = url.partition("?")
+    merged = {}
+    for kv in query.split("&"):
+        if kv and "=" in kv:
+            k, v = kv.split("=", 1)
+            merged[k] = v
+    for k, v in (params or {}).items():
+        merged[k] = str(v)
+    for sig in ("wts", "w_rid"):
+        merged.pop(sig, None)
+    return merged
+
+
+def _cache_key(session, url: str, params=None) -> str:
+    """Cache key = account + endpoint path + sorted query (URL query AND requests
+    params kwarg — the params never travel inside the URL string itself)."""
+    base, _, _ = url.partition("?")
     p = _cache_path(url) or "/"
     if p == "/x/web-interface/view":
         base = base.replace(p, "/x/web-interface/wbi/view")
-    params = sorted(
-        kv for kv in query.split("&") if kv and not kv.startswith(("wts=", "w_rid="))
-    )
-    return f"{_account_key(session)}:{base}?{'&'.join(params)}"
+    merged = _normalize_query(url, params)
+    norm = "&".join(f"{k}={merged[k]}" for k in sorted(merged))
+    return f"{_account_key(session)}:{base}?{norm}"
 
 
 # -- breaker ------------------------------------------------------------------
@@ -154,9 +171,9 @@ def throttle() -> None:
 
 # -- guard lifecycle ----------------------------------------------------------
 
-def _cached(session, url: str, ttl_s: float):
+def _cached(session, url: str, ttl_s: float, params=None):
     """TTL-fresh hit, or (ban only) a stale-but-valid hit for static metadata."""
-    key = _cache_key(session, url)
+    key = _cache_key(session, url, params)
     store = _read_json(CACHE_FILE, {})
     hit = store.get(key)
     if not hit:
@@ -173,11 +190,11 @@ def _cached(session, url: str, ttl_s: float):
     return None
 
 
-def _store(session, url: str, body: dict) -> None:
+def _store(session, url: str, body: dict, params=None) -> None:
     # cacheable static metadata + nav (the rotating WBI keys make repeated signing cheap)
     if not _cacheable(url) and _cache_path(url) != NAV_PATH:
         return
-    key = _cache_key(session, url)
+    key = _cache_key(session, url, params)
     store = _read_json(CACHE_FILE, {})
     store[key] = {"at": time.time(), "data": body}
     keys = sorted(store, key=lambda k: store[k].get("at", 0))
@@ -186,14 +203,14 @@ def _store(session, url: str, body: dict) -> None:
     _write_json(CACHE_FILE, store)
 
 
-def preflight(session, url: str, ttl_s: float = CACHE_TTL_S):
+def preflight(session, url: str, ttl_s: float = CACHE_TTL_S, params=None):
     """Before any request: breaker first, then cache. Returns a cached body or None.
     Raises GuardBlocked when the breaker is active and no cache can carry the call."""
     if _no_cache() or "bilibili.com" not in url:
         return None
     banned_until = _ban_active()
     if banned_until:
-        hit = _cached(session, url, ttl_s)
+        hit = _cached(session, url, ttl_s, params)
         if hit is not None:
             _log_request(True, _cache_path(url) or url)
             return hit
@@ -201,14 +218,14 @@ def preflight(session, url: str, ttl_s: float = CACHE_TTL_S):
         raise GuardBlocked(
             f"risk-control pause active ({ban_state().get('why')}) — about {mins} min left; "
             "cached answers only until then (state: ~/.bili-cli/api-ban.json)")
-    hit = _cached(session, url, ttl_s)
+    hit = _cached(session, url, ttl_s, params)
     if hit is not None:
         _log_request(True, _cache_path(url) or url)
         return hit
     return None
 
 
-def classify(session, url: str, status: int, body: dict | None, *, ttl_s: float = CACHE_TTL_S):
+def classify(session, url: str, status: int, body: dict | None, *, ttl_s: float = CACHE_TTL_S, params=None):
     """After a network response: returns None on pass, or a GuardBlocked with the verdict.
     HTTP 412/429 and interface-level ban codes both arm the exponential breaker."""
     if _no_cache() or "bilibili.com" not in url:
@@ -223,7 +240,7 @@ def classify(session, url: str, status: int, body: dict | None, *, ttl_s: float 
             f"API code={body.get('code')} ({body.get('message', '')}) — risk control, paused {mins} min")
     if isinstance(body, dict) and body.get("code") == 0:
         _clear_streak(path)
-        _store(session, url, body)
+        _store(session, url, body, params)
     return None
 
 
@@ -231,7 +248,7 @@ def guarded_get(session, url: str, *, params=None, headers=None, timeout=15, ttl
     """Full GET lifecycle for api.bilibili.com calls: preflight -> throttle -> request ->
     classify. Returns the parsed JSON body (dict); raises GuardBlocked when the guard
     refused (ban) — callers translate to their own error convention."""
-    hit = preflight(session, url, ttl_s)
+    hit = preflight(session, url, ttl_s, params)
     if hit is not None:
         return hit
     throttle()
@@ -241,11 +258,11 @@ def guarded_get(session, url: str, *, params=None, headers=None, timeout=15, ttl
         if not isinstance(body, dict):
             raise ValueError
     except ValueError:
-        blocked = classify(session, url, r.status_code, None, ttl_s=ttl_s)
+        blocked = classify(session, url, r.status_code, None, ttl_s=ttl_s, params=params)
         raise GuardBlocked(
             blocked.args[0] if blocked else
             f"non-JSON response (HTTP {r.status_code}) — endpoint may have changed or risk control")
-    blocked = classify(session, url, r.status_code, body, ttl_s=ttl_s)
+    blocked = classify(session, url, r.status_code, body, ttl_s=ttl_s, params=params)
     if blocked is not None:
         raise blocked
     _log_request(False, _cache_path(url) or url)
