@@ -90,6 +90,73 @@ def cmd_logout(args):
     _emit({"ok": True, "removed": auth.clear(), "stored": str(auth.COOKIE_FILE)})
 
 
+def cmd_dm(args):
+    """Restricted DM: guards first (dm.py), --dry preview, --yes to send, everything ledgered.
+    Send path = durable reservation under the ledger lock BEFORE the network call, then
+    finalize to sent/failed; refusals are recorded audit-only."""
+    from . import dm
+    api = BiliAPI(); api.require_auth("dm")
+    if args.status:
+        _emit(dm.status())
+        return
+    if not args.to or not args.msg:
+        raise SystemExit("dm needs --to <mid|@nickname> --msg <text>  (or --status)")
+    text = (args.msg or "").strip()   # normalize ONCE — the same text is validated, previewed, sent and ledgered
+    if not text:
+        print("[dm] 消息不能为空", file=sys.stderr)
+        raise SystemExit(1)
+    if not args.dry:
+        _need_yes(args, "dm send")
+    who = me = rel = None
+    reserved = False
+    try:
+        who = dm.resolve(api, args.to)
+        me = api.me() or {}
+        rel = dm.relation(api, who["mid"])
+        if not rel["mutual"] and not args.allow_non_mutual:
+            raise dm.DMPolicyError(
+                f"未互关（自己 attribute={rel['attribute']}，对方 be={rel['be_attribute']}）——"
+                f"确需发送加 --allow-non-mutual（会记入台账）")
+        if args.dry:
+            info = dm.check(dm.load_ledger(), who["mid"], text, me_mid=me.get("mid"))
+            _emit({"to": who, "text": text, **info,
+                   "mutual": rel["mutual"], "forced": bool(args.allow_non_mutual),
+                   "ok": True, "sent": False, "dry_run": True})
+            return
+        info = dm.reserve(who["mid"], text, mutual=rel["mutual"],
+                          forced=bool(args.allow_non_mutual), me_mid=me.get("mid"),
+                          name=who.get("name"))
+        reserved = True
+        try:
+            dm.send(api, who["mid"], text)
+        except dm.DMPolicyError as e:
+            dm.finalize_failed(who["mid"], reason=str(e))   # stays quota-bearing
+            raise
+        try:
+            dm.finalize_sent(who["mid"])
+        except OSError as e:
+            # the send itself succeeded; the pending row keeps counting either way
+            print(f"[dm] 警告：发送成功但台账终写失败（{e}）——pending 记录将按配额占用处理", file=sys.stderr)
+    except dm.DMLedgerError as e:
+        print(f"[dm] {e}", file=sys.stderr)
+        raise SystemExit(1)
+    except dm.DMPolicyError as e:
+        if who is not None and not reserved:
+            # refusal (guard / non-mutual / send attempt): audit-only row, never overwritten
+            try:
+                dm.record_refused(who["mid"], text, reason=str(e),
+                                  mutual=rel.get("mutual") if rel else None,
+                                  forced=bool(args.allow_non_mutual),
+                                  me_mid=(me or {}).get("mid"), name=who.get("name"))
+            except dm.DMLedgerError as le:
+                print(f"[dm] 无法补记拒绝台账：{le}", file=sys.stderr)
+        print(f"[dm] {e}", file=sys.stderr)
+        raise SystemExit(1)
+    _emit({"to": who, "text": text, **info,
+           "mutual": rel["mutual"], "forced": bool(args.allow_non_mutual),
+           "ok": True, "sent": True})
+
+
 def cmd_me(args):
     api = BiliAPI(); api.require_auth("me")
     d = api.me() or {}
@@ -303,6 +370,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("logout", help="delete the stored credential (~/.bili-cli/cookies.json)")
     s.set_defaults(fn=cmd_logout)
+
+    s = sub.add_parser("dm", help="restricted direct message (mutual follow by default, capped, ledgered)")
+    s.add_argument("--to", help="recipient: mid or @nickname")
+    s.add_argument("--msg", help="message text (<=450 chars)")
+    s.add_argument("--dry", action="store_true", help="run the guards and print the exact payload; send nothing")
+    s.add_argument("--status", action="store_true", help="today's budget + the last few entries")
+    s.add_argument("--allow-non-mutual", action="store_true",
+                   help="send without mutual follow (recorded as forced in the ledger)")
+    s.add_argument("--yes", action="store_true", help="explicit confirmation gate for the actual send")
+    s.set_defaults(fn=cmd_dm)
 
     s = sub.add_parser("me", help="my info (mid/name/level/VIP)")
     s.set_defaults(fn=cmd_me)
