@@ -11,6 +11,14 @@ import requests
 
 from bilicli import qrlogin
 
+try:
+    import qrcode  # noqa: F401 — optional rendering extra
+    QR_AVAILABLE = True
+except ImportError:
+    QR_AVAILABLE = False
+
+QR_SKIP = f'qr extra not installed: uv pip install "bilicli[qr]" (or uv run --extra qr ...)'
+
 
 class Resp:
     def __init__(self, payload):
@@ -84,11 +92,13 @@ class LoginFlowTests(unittest.TestCase):
         self.assertIn("扫码确认完成", out)   # final 登录成功 line comes from cli after verification
         self.assertFalse(self.png.exists(), "consumed QR must not stay on disk")
 
+    @unittest.skipUnless(QR_AVAILABLE, QR_SKIP)
     def test_keep_qr_leaves_the_file(self):
         s = FakeSession([gen_ok()], [poll(0)])
         self.run_login(s, keep_qr=True)
         self.assertTrue(self.png.exists())
 
+    @unittest.skipUnless(QR_AVAILABLE, QR_SKIP)
     def test_png_is_written_owner_only(self):
         s = FakeSession([gen_ok()], [poll(0)])
         self.run_login(s, keep_qr=True)
@@ -101,6 +111,7 @@ class LoginFlowTests(unittest.TestCase):
         self.assertEqual(out.count("等待扫码"), 1)
         self.assertEqual(out.count("已扫码"), 1)
 
+    @unittest.skipUnless(QR_AVAILABLE, QR_SKIP)
     def test_json_events_are_ndjson(self):
         s = FakeSession([gen_ok()], [poll(86101), poll(0)])
         _, out = self.run_login(s, json_events=True)
@@ -152,6 +163,35 @@ class LoginFlowTests(unittest.TestCase):
         self.assertEqual(err["api_code"], -412)
         self.assertEqual([c[0] for c in s.calls].count("poll"), 1)  # no retry-until-timeout
 
+    def test_network_retry_exhaustion_is_structured_error_event(self):
+        """All poll retries failing must exit 1 via a JSON `error` event (reason=network),
+        never a bare-text stderr line in json-events mode."""
+        s = FakeSession([gen_ok()],
+                        [requests.ConnectionError("down")] * qrlogin.NETWORK_RETRIES)
+        stream = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            qrlogin.login(png_path=self.png, stream=stream, session=s,
+                          timeout_s=30, json_events=True)
+        self.assertEqual(ctx.exception.code, 1)
+        events = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+        err = [e for e in events if e["event"] == "error"][-1]
+        self.assertEqual(err["reason"], "network")
+        self.assertEqual(err["exit"], 1)
+
+    def test_generate_missing_fields_is_structured_error_event(self):
+        """A generate response without qrcode_key/url must exit 1 via a JSON `error`
+        event (reason=protocol), not a bare-text stderr line in json-events mode."""
+        s = FakeSession([{"code": 0, "data": {}}], [])
+        stream = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            qrlogin.login(png_path=self.png, stream=stream, session=s,
+                          timeout_s=30, json_events=True)
+        self.assertEqual(ctx.exception.code, 1)
+        events = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+        err = [e for e in events if e["event"] == "error"][-1]
+        self.assertEqual(err["reason"], "protocol")
+        self.assertEqual(err["exit"], 1)
+
     def test_expired_qr_is_regenerated_once(self):
         s = FakeSession([gen_ok(), gen_ok(key="k2")], [poll(86038), poll(0)])
         jar, out = self.run_login(s)
@@ -199,6 +239,7 @@ class LoginFlowTests(unittest.TestCase):
 
 
 class AsciiTests(unittest.TestCase):
+    @unittest.skipUnless(QR_AVAILABLE, QR_SKIP)
     def test_render_ascii_has_blocks(self):
         art = qrlogin.render_ascii("https://www.bilibili.com/h5/login?qrcode_key=k")
         self.assertTrue(art)

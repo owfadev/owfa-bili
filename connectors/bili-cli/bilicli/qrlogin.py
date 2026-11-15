@@ -203,7 +203,8 @@ class Events:
 
 # --------------------------------------------------------------------------- flow
 
-def _request_json(session, url: str, params: dict | None = None, attempts: int = NETWORK_RETRIES) -> dict:
+def _request_json(session, url: str, params: dict | None = None, attempts: int = NETWORK_RETRIES,
+                  events: "Events | None" = None) -> dict:
     """GET with bounded retries; the passport host is not under the api rate-limiter."""
     last = None
     for i in range(attempts):
@@ -213,23 +214,23 @@ def _request_json(session, url: str, params: dict | None = None, attempts: int =
             last = e
             if i + 1 < attempts:
                 _sleep(1 + i)
-    _fail(f"passport 请求失败（已重试 {attempts} 次）：{last}", 1)
+    _fail(f"passport 请求失败（已重试 {attempts} 次）：{last}", 1, events=events, reason="network")
 
 
-def _generate(session) -> tuple[str, str]:
-    body = _request_json(session, QR_GENERATE)
+def _generate(session, events: "Events | None" = None) -> tuple[str, str]:
+    body = _request_json(session, QR_GENERATE, events=events)
     if body.get("code") != 0:
         raise QRApiError(body.get("code"), body.get("message"))
     data = body.get("data") or {}
     key, url = data.get("qrcode_key"), data.get("url")
     if not key or not url:
-        _fail("二维码生成失败：响应缺少 qrcode_key/url", 1)
+        _fail("二维码生成失败：响应缺少 qrcode_key/url", 1, events=events, reason="protocol")
     return key, url
 
 
-def _poll(session, key: str) -> dict:
+def _poll(session, key: str, events: "Events | None" = None) -> dict:
     """Poll one round; raises QRApiError on top-level API errors (code != 0)."""
-    body = _request_json(session, QR_POLL, params={"qrcode_key": key})
+    body = _request_json(session, QR_POLL, params={"qrcode_key": key}, events=events)
     if body.get("code") != 0:
         # e.g. -412 risk control: retrying the poll would only burn the whole timeout
         raise QRApiError(body.get("code"), body.get("message"))
@@ -278,7 +279,7 @@ def login(timeout_s: int = 180, png_path: Path | str | None = QR_PNG, *,
 def _login_round(session, events, deadline, *, regenerate_left, timeout_s,
                  png_path, ascii_qr, keep_qr) -> dict:
     while True:
-        key, url = _generate(session)
+        key, url = _generate(session, events)
         png = None
         if png_path:
             try:
@@ -299,7 +300,7 @@ def _login_round(session, events, deadline, *, regenerate_left, timeout_s,
 
         expired = False
         while _now() < deadline:
-            data = _poll(session, key)
+            data = _poll(session, key, events)
             code = data.get("code")
             if code == 0:
                 jar = _jar(session, data.get("url") or "")

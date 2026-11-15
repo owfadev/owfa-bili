@@ -9,6 +9,14 @@ import requests
 
 from bilicli import auth, qrlogin
 
+try:
+    import qrcode  # noqa: F401 — optional rendering extra
+    QR_AVAILABLE = True
+except ImportError:
+    QR_AVAILABLE = False
+
+QR_SKIP = f'qr extra not installed: uv pip install "bilicli[qr]" (or uv run --extra qr ...)'
+
 
 class ParseTests(unittest.TestCase):
     def test_browser_header(self):
@@ -90,6 +98,7 @@ class StorageTests(unittest.TestCase):
 
 
 class PngTests(unittest.TestCase):
+    @unittest.skipUnless(QR_AVAILABLE, QR_SKIP)
     def test_png_header_and_size(self):
         matrix = qrlogin.matrix_for("https://example.com/login?k=v")
         self.assertGreater(len(matrix), 20)
