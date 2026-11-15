@@ -1,6 +1,6 @@
 # bili-cli
 
-Connector for the wiki bilibili domain (web-cookie login state, homegrown lightweight implementation: requests + self-implemented WBI signing, no community-library dependency). Contract: `.meta/plugins/bili/`.
+Connector for the wiki bilibili domain (web-cookie login state, homegrown lightweight implementation: requests + self-implemented WBI signing, no community-library dependency). Contract: `.owfa/plugins/domains/bili/`.
 
 ## Discipline
 
