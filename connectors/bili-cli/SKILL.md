@@ -6,7 +6,7 @@ description: "Access bilibili.com via the connectors/bili-cli CLI (web-cookie au
 
 # bili-cli: bilibili Read-Mostly Connector
 
-Pull data from bilibili.com via `connectors/bili-cli/` and relay as answer. Query-and-answer by default: nothing is written to wiki unless the plugin contract (`.meta/plugins/bili/`) says so. Output is single-line JSON; distill before relaying.
+Pull data from bilibili.com via `connectors/bili-cli/` and relay as answer. Query-and-answer by default: nothing is written to wiki unless the plugin contract (`.owfa/plugins/domains/bili/`) says so. Output is single-line JSON; distill before relaying.
 
 ## Scope
 
