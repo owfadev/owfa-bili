@@ -81,7 +81,7 @@ class LoginFlowTests(unittest.TestCase):
         s = FakeSession([gen_ok()], [poll(0)])
         jar, out = self.run_login(s)
         self.assertEqual(jar["SESSDATA"], "sess")
-        self.assertIn("登录成功", out)
+        self.assertIn("扫码确认完成", out)   # final 登录成功 line comes from cli after verification
         self.assertFalse(self.png.exists(), "consumed QR must not stay on disk")
 
     def test_keep_qr_leaves_the_file(self):
@@ -108,9 +108,49 @@ class LoginFlowTests(unittest.TestCase):
         names = [e["event"] for e in events]
         self.assertEqual(names[0], "qr")
         self.assertIn("state", names)
-        self.assertEqual(names[-1], "success")
+        self.assertEqual(names[-1], "scanned")   # success comes from cli.py after persist+nav
         self.assertEqual(events[0]["png"], str(self.png))
         self.assertEqual(events[-1]["mid"], "42")
+
+    def test_json_mode_has_no_success_event(self):
+        """login() itself must NOT claim success — persistence + nav verification
+        happen in the caller (review finding #1)."""
+        s = FakeSession([gen_ok()], [poll(0)])
+        _, out = self.run_login(s, json_events=True)
+        self.assertNotIn('"event": "success"', out)
+        self.assertNotIn('"event":"success"', out)
+
+    def test_json_mode_never_prints_ascii_qr(self):
+        """No QR block characters may pollute the NDJSON stderr channel, even on a TTY
+        or with an explicit ascii request (review finding #2)."""
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        for kwargs in ({}, {"ascii_qr": True}):
+            with self.subTest(**kwargs):
+                stream = Tty()
+                with mock.patch.object(qrlogin, "render_ascii",
+                                       side_effect=AssertionError("must not render")):
+                    qrlogin.login(png_path=self.png, stream=stream, session=FakeSession([gen_ok()], [poll(0)]),
+                                  timeout_s=30, json_events=True, **kwargs)
+                for line in stream.getvalue().splitlines():
+                    json.loads(line)   # every line must be valid NDJSON
+
+    def test_poll_api_error_is_terminal_exit_1(self):
+        """Top-level poll error (e.g. -412) exits 1 with a structured error event,
+        not a silent retry until timeout/exit 2 (review finding #3)."""
+        s = FakeSession([gen_ok()], [{"code": -412, "message": "blocked", "data": None}])
+        stream = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            qrlogin.login(png_path=self.png, stream=stream, session=s,
+                          timeout_s=30, json_events=True)
+        self.assertEqual(ctx.exception.code, 1)
+        events = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+        err = [e for e in events if e["event"] == "error"][-1]
+        self.assertEqual(err["reason"], "api")
+        self.assertEqual(err["api_code"], -412)
+        self.assertEqual([c[0] for c in s.calls].count("poll"), 1)  # no retry-until-timeout
 
     def test_expired_qr_is_regenerated_once(self):
         s = FakeSession([gen_ok(), gen_ok(key="k2")], [poll(86038), poll(0)])
@@ -167,6 +207,49 @@ class AsciiTests(unittest.TestCase):
     def test_render_ascii_is_none_without_lib(self):
         with mock.patch.dict("sys.modules", {"qrcode": None}):
             self.assertIsNone(qrlogin.render_ascii("x"))
+
+
+class CliLoginTests(unittest.TestCase):
+    """cmd_login ordering: `success` only after persistence AND nav verification."""
+
+    def _args(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(qrcode=True, timeout=1, no_png=True, png=None,
+                               keep_qr=False, ascii=False, json_events=True,
+                               cookie=None, file=None)
+
+    def _run(self, me_result):
+        from bilicli import cli
+        err = io.StringIO()
+        with mock.patch("bilicli.qrlogin.login", return_value={"SESSDATA": "x"}) as m, \
+             mock.patch("bilicli.auth.save_cookies") as save, \
+             mock.patch("bilicli.cli.BiliAPI") as API, \
+             mock.patch("bilicli.cli._emit"), \
+             mock.patch("sys.stderr", err):
+            API.return_value.me.return_value = me_result
+            try:
+                cli.cmd_login(self._args())
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue(), m, save
+
+    def test_success_emitted_after_persist_and_verify(self):
+        code, err, login, save = self._run({"isLogin": True, "mid": 42, "uname": "u"})
+        self.assertEqual(code, 0)
+        save.assert_called_once()
+        events = [json.loads(l) for l in err.splitlines() if l.strip()]
+        self.assertEqual(events[-1]["event"], "success")
+        self.assertEqual(events[-1]["mid"], 42)
+
+    def test_failed_nav_verification_gives_error_event_exit_1(self):
+        code, err, _, save = self._run({"isLogin": False})
+        self.assertEqual(code, 1)
+        save.assert_called_once()   # persisted …
+        events = [json.loads(l) for l in err.splitlines() if l.strip()]
+        self.assertEqual(events[-1]["event"], "error")
+        self.assertEqual(events[-1]["reason"], "verification")
+        self.assertNotIn('"event": "success"', err)
 
 
 if __name__ == "__main__":

@@ -63,10 +63,24 @@ def status_label(code) -> str:
     return QR_STATUS.get(code, f"未知状态 {code}")
 
 
-def _fail(msg: str, code: int = 1):
-    """Report on stderr and leave with a scriptable exit code (1 = failure, 2 = retryable)."""
-    print(msg, file=sys.stderr, flush=True)
+def _fail(msg: str, code: int = 1, events=None, **fields):
+    """Report on stderr and leave with a scriptable exit code (1 = failure, 2 = retryable).
+    In JSON event mode the failure is a structured `error` event, not a plain-text line."""
+    if events is not None and events.json_mode:
+        events.emit("error", message=msg, exit=code, **fields)
+    else:
+        print(msg, file=sys.stderr, flush=True)
     raise SystemExit(code)
+
+
+class QRApiError(Exception):
+    """The passport API answered with a non-zero top-level code (risk control etc.).
+    Terminal for this attempt: retrying the poll would only burn the timeout."""
+
+    def __init__(self, code, message):
+        super().__init__(f"passport 接口错误：code={code} {message or ''}".rstrip())
+        self.api_code = code
+        self.api_message = message
 
 
 # --------------------------------------------------------------------------- payload helpers
@@ -177,6 +191,8 @@ class Events:
             self._write("[login] 用 bilibili App 扫码登录（约 3 分钟有效，扫完还要在手机上点确认）")
         elif event == "state":
             self._write(f"[login] {fields.get('label', '')}")
+        elif event == "scanned":
+            self._write("[login] 扫码确认完成，正在校验凭证…")
         elif event == "success":
             self._write("[login] 登录成功，凭证已写入本机")
         elif event == "regenerate":
@@ -203,7 +219,7 @@ def _request_json(session, url: str, params: dict | None = None, attempts: int =
 def _generate(session) -> tuple[str, str]:
     body = _request_json(session, QR_GENERATE)
     if body.get("code") != 0:
-        _fail(f"二维码生成失败：code={body.get('code')} {body.get('message')}", 1)
+        raise QRApiError(body.get("code"), body.get("message"))
     data = body.get("data") or {}
     key, url = data.get("qrcode_key"), data.get("url")
     if not key or not url:
@@ -212,7 +228,11 @@ def _generate(session) -> tuple[str, str]:
 
 
 def _poll(session, key: str) -> dict:
+    """Poll one round; raises QRApiError on top-level API errors (code != 0)."""
     body = _request_json(session, QR_POLL, params={"qrcode_key": key})
+    if body.get("code") != 0:
+        # e.g. -412 risk control: retrying the poll would only burn the whole timeout
+        raise QRApiError(body.get("code"), body.get("message"))
     return body.get("data") or {}
 
 
@@ -234,6 +254,10 @@ def login(timeout_s: int = 180, png_path: Path | str | None = QR_PNG, *,
     events = Events(stream, json_mode=json_events)
     if ascii_qr is None:
         ascii_qr = bool(getattr(stream, "isatty", lambda: False)())
+    if ascii_qr and json_events:
+        # QR block characters on the NDJSON channel would break line-by-line JSON consumers
+        ascii_qr = False
+        events.emit("hint", text="JSON 模式下不渲染终端二维码；请使用 PNG 文件或 --no-png 后的 url 字段")
 
     session = session or requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"})
@@ -241,6 +265,18 @@ def login(timeout_s: int = 180, png_path: Path | str | None = QR_PNG, *,
     deadline = _now() + timeout_s
     regenerate_left = 1  # one automatic replacement when the QR expires mid-wait
 
+    while True:
+        try:
+            return _login_round(session, events, deadline,
+                                regenerate_left=regenerate_left,
+                                timeout_s=timeout_s, png_path=png_path,
+                                ascii_qr=ascii_qr, keep_qr=keep_qr)
+        except QRApiError as e:
+            _fail(str(e), 1, events=events, reason="api", api_code=e.api_code)
+
+
+def _login_round(session, events, deadline, *, regenerate_left, timeout_s,
+                 png_path, ascii_qr, keep_qr) -> dict:
     while True:
         key, url = _generate(session)
         png = None
@@ -254,7 +290,7 @@ def login(timeout_s: int = 180, png_path: Path | str | None = QR_PNG, *,
         if ascii_qr:
             art = render_ascii(url)
             if art:
-                print(art, file=stream, end="", flush=True)
+                print(art, file=events.stream, end="", flush=True)
         if png is None:
             events.emit("hint", text='未安装二维码渲染依赖（可选）：uv pip install "bilicli[qr]"')
             events.emit("hint", text=f"二维码内容：{url}")
@@ -272,7 +308,10 @@ def login(timeout_s: int = 180, png_path: Path | str | None = QR_PNG, *,
                         png.unlink()  # a consumed QR is still a credential; don't leave it around
                     except OSError:
                         pass
-                events.emit("success", mid=jar.get("DedeUserID"))
+                # `scanned` = the passport flow completed and cookies were captured.
+                # The final `success` event is emitted by the caller (cli.py) only after
+                # the credential is persisted AND nav verification confirms it.
+                events.emit("scanned", mid=jar.get("DedeUserID"))
                 return jar
             events.emit("state", code=code, label=status_label(code))
             if code == 86038:
@@ -285,7 +324,7 @@ def login(timeout_s: int = 180, png_path: Path | str | None = QR_PNG, *,
             events.emit("regenerate")
             continue
         if expired:
-            events.emit("error", reason="expired")
-            _fail(f"二维码已过期（{timeout_s}s 内未完成扫码），请重新运行 bili-cli login --qrcode", 2)
-        events.emit("error", reason="timeout")
-        _fail(f"等待扫码超时（{timeout_s}s），请重新运行 bili-cli login --qrcode", 2)
+            _fail(f"二维码已过期（{timeout_s}s 内未完成扫码），请重新运行 bili-cli login --qrcode", 2,
+                  events=events, reason="expired")
+        _fail(f"等待扫码超时（{timeout_s}s），请重新运行 bili-cli login --qrcode", 2,
+              events=events, reason="timeout")

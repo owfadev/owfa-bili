@@ -39,6 +39,7 @@ def _report_login() -> dict:
 def cmd_login(args):
     if getattr(args, "qrcode", False):
         from . import qrlogin
+        events = qrlogin.Events(sys.stderr, json_mode=args.json_events)
         try:
             jar = qrlogin.login(
                 timeout_s=args.timeout,
@@ -50,11 +51,19 @@ def cmd_login(args):
         except KeyboardInterrupt:
             print("[login] 已取消", file=sys.stderr)
             raise SystemExit(130)
-        auth.save_cookies(jar)
-        out = _report_login()
+        # persist, then verify against nav — `success` is only true after both
+        try:
+            auth.save_cookies(jar)
+        except OSError as e:
+            qrlogin._fail(f"凭证写入失败（{e}）", 1, events=events, reason="storage")
+        try:
+            out = _report_login()
+        except SystemExit as e:  # nav verification itself failed hard (guard/network)
+            qrlogin._fail(f"nav 校验失败：{e}", 1, events=events, reason="verification")
         if not out.get("ok"):
-            print("[login] 凭证已写入，但 nav 校验未通过（风控或已失效）——重试 --qrcode", file=sys.stderr)
-            raise SystemExit(1)
+            qrlogin._fail("凭证已写入，但 nav 校验未通过（风控或已失效）——重试 --qrcode", 1,
+                          events=events, reason="verification")
+        events.emit("success", mid=out.get("mid"), uname=out.get("uname"))
         _emit(out)
         return
     if args.file or args.cookie:
