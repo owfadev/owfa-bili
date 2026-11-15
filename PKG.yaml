@@ -1,6 +1,6 @@
 schema_version: 1
 id: bili
-version: 0.5
+version: 0.5.1
 compat: ">= 0.2"
 members: [bili, bili-pet]
 connectors:
