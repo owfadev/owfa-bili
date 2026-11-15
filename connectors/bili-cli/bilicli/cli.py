@@ -91,7 +91,9 @@ def cmd_logout(args):
 
 
 def cmd_dm(args):
-    """Restricted DM: guards first (dm.py), --dry preview, --yes to send, everything ledgered."""
+    """Restricted DM: guards first (dm.py), --dry preview, --yes to send, everything ledgered.
+    Send path = durable reservation under the ledger lock BEFORE the network call, then
+    finalize to sent/failed; refusals are recorded audit-only."""
     from . import dm
     api = BiliAPI(); api.require_auth("dm")
     if args.status:
@@ -99,29 +101,60 @@ def cmd_dm(args):
         return
     if not args.to or not args.msg:
         raise SystemExit("dm needs --to <mid|@nickname> --msg <text>  (or --status)")
-    _need_yes(args, "dm send") if not args.dry else None
+    text = (args.msg or "").strip()   # normalize ONCE — the same text is validated, previewed, sent and ledgered
+    if not text:
+        print("[dm] 消息不能为空", file=sys.stderr)
+        raise SystemExit(1)
+    if not args.dry:
+        _need_yes(args, "dm send")
+    who = me = rel = None
+    reserved = False
     try:
         who = dm.resolve(api, args.to)
         me = api.me() or {}
-        info = dm.check(dm.load_ledger(), who["mid"], args.msg, me_mid=me.get("mid"))
         rel = dm.relation(api, who["mid"])
         if not rel["mutual"] and not args.allow_non_mutual:
             raise dm.DMPolicyError(
                 f"未互关（自己 attribute={rel['attribute']}，对方 be={rel['be_attribute']}）——"
                 f"确需发送加 --allow-non-mutual（会记入台账）")
-        payload = {"to": who, "text": args.msg, **info,
-                   "mutual": rel["mutual"], "forced": bool(args.allow_non_mutual)}
         if args.dry:
-            _emit({**payload, "ok": True, "sent": False, "dry_run": True})
+            info = dm.check(dm.load_ledger(), who["mid"], text, me_mid=me.get("mid"))
+            _emit({"to": who, "text": text, **info,
+                   "mutual": rel["mutual"], "forced": bool(args.allow_non_mutual),
+                   "ok": True, "sent": False, "dry_run": True})
             return
-        dm.send(api, who["mid"], args.msg)
-        dm.record(dm.entry(who["mid"], args.msg, ok=True, mutual=rel["mutual"],
-                           forced=bool(args.allow_non_mutual), me_mid=me.get("mid"),
-                           name=who.get("name")))
-    except dm.DMPolicyError as e:
+        info = dm.reserve(who["mid"], text, mutual=rel["mutual"],
+                          forced=bool(args.allow_non_mutual), me_mid=me.get("mid"),
+                          name=who.get("name"))
+        reserved = True
+        try:
+            dm.send(api, who["mid"], text)
+        except dm.DMPolicyError as e:
+            dm.finalize_failed(who["mid"], reason=str(e))   # stays quota-bearing
+            raise
+        try:
+            dm.finalize_sent(who["mid"])
+        except OSError as e:
+            # the send itself succeeded; the pending row keeps counting either way
+            print(f"[dm] 警告：发送成功但台账终写失败（{e}）——pending 记录将按配额占用处理", file=sys.stderr)
+    except dm.DMLedgerError as e:
         print(f"[dm] {e}", file=sys.stderr)
         raise SystemExit(1)
-    _emit({**payload, "ok": True, "sent": True})
+    except dm.DMPolicyError as e:
+        if who is not None and not reserved:
+            # refusal (guard / non-mutual / send attempt): audit-only row, never overwritten
+            try:
+                dm.record_refused(who["mid"], text, reason=str(e),
+                                  mutual=rel.get("mutual") if rel else None,
+                                  forced=bool(args.allow_non_mutual),
+                                  me_mid=(me or {}).get("mid"), name=who.get("name"))
+            except dm.DMLedgerError as le:
+                print(f"[dm] 无法补记拒绝台账：{le}", file=sys.stderr)
+        print(f"[dm] {e}", file=sys.stderr)
+        raise SystemExit(1)
+    _emit({"to": who, "text": text, **info,
+           "mutual": rel["mutual"], "forced": bool(args.allow_non_mutual),
+           "ok": True, "sent": True})
 
 
 def cmd_me(args):

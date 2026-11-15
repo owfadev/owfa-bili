@@ -10,6 +10,7 @@ This is the *only* DM surface the connector offers, and the walls are code, not 
 The CLI adds the second gate: --yes. The agent layer adds the first: an explicit user verb.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -29,20 +30,20 @@ LEDGER_MAX = 500
 
 LEDGER_FILE = CONFIG_DIR / "dm-ledger.json"
 DEVICE_FILE = CONFIG_DIR / "dm-device-id"
+LOCK_TIMEOUT_S = 10
 
 
 class DMPolicyError(RuntimeError):
     """A guard refused the send — the message is user-facing."""
 
 
+class DMLedgerError(DMPolicyError):
+    """The ledger exists but cannot be trusted (unreadable/corrupt/wrong shape).
+    Fail closed: quota history is unknown, so no send may proceed, and the
+    evidence on disk must not be overwritten until a human recovers it."""
+
+
 # --------------------------------------------------------------------------- ledger
-
-def _read_json(path: Path, fallback):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return fallback
-
 
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,12 +57,50 @@ def _write_json(path: Path, data) -> None:
 
 
 def load_ledger() -> list:
-    rows = _read_json(LEDGER_FILE, [])
-    return rows if isinstance(rows, list) else []
+    """Fail-closed ledger read: a missing file is first use, anything else that
+    prevents a trustworthy read raises DMLedgerError (sends refuse; nothing is
+    overwritten)."""
+    try:
+        text = LEDGER_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        raise DMLedgerError(f"私信台账不可读（{e}）——已拒绝发送以免绕过配额；请人工检查 {LEDGER_FILE}")
+    try:
+        rows = json.loads(text)
+    except ValueError:
+        raise DMLedgerError(f"私信台账损坏（非法 JSON）——已拒绝发送以免绕过配额；请人工检查 {LEDGER_FILE}")
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise DMLedgerError("私信台账结构异常（应为记录数组）——已拒绝发送以免绕过配额；请人工检查")
+    return rows
+
+
+@contextlib.contextmanager
+def _ledger_lock(timeout_s: float = LOCK_TIMEOUT_S):
+    """Cross-process mutual exclusion via an exclusive lock file (O_CREAT|O_EXCL)."""
+    lock_path = LEDGER_FILE.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout_s
+    fd = None
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            break
+        except FileExistsError:
+            if time.time() > deadline:
+                raise DMLedgerError(f"私信台账锁等待超时（{timeout_s}s）——另一进程可能正在发送")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(lock_path)
 
 
 def record(entry: dict) -> dict:
-    rows = [r for r in load_ledger() if isinstance(r, dict)]
+    rows = load_ledger()
     rows.append(entry)
     _write_json(LEDGER_FILE, rows[-LEDGER_MAX:])
     return entry
@@ -83,7 +122,8 @@ def _fmt_gap(seconds: float) -> str:
 
 
 def check(ledger: list, mid: int, text: str, *, me_mid=None, now: float | None = None) -> dict:
-    """Run every offline guard; returns a summary for the dry-run, raises DMPolicyError otherwise."""
+    """Run every offline guard; returns a summary for the dry-run, raises DMPolicyError otherwise.
+    Refusal rows (kind="refused") are audit-only: they never consume quota or gates."""
     now = time.time() if now is None else now
     text = (text or "").strip()
     if not text:
@@ -93,6 +133,7 @@ def check(ledger: list, mid: int, text: str, *, me_mid=None, now: float | None =
     if me_mid and str(mid) == str(me_mid):
         raise DMPolicyError("不能给自己发私信")
 
+    ledger = [r for r in ledger if r.get("kind") != "refused"]
     last24 = _recent(ledger, now, 24)
     if len(last24) >= DM_MAX_PER_DAY:
         oldest = min(float(r["ts"]) for r in last24)
@@ -204,13 +245,14 @@ def send(api, mid: int, text: str) -> dict:
 
 
 def entry(mid: int, text: str, *, ok: bool, mutual: bool, forced: bool,
-          code=None, me_mid=None, name=None) -> dict:
+          kind: str = "sent", code=None, reason=None, me_mid=None, name=None) -> dict:
     return {
         "at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "ts": time.time(),
         "mid": str(mid),
         "name": name,
         "me": str(me_mid) if me_mid else None,
+        "kind": kind,          # pending | sent | failed | refused (refused = audit-only)
         "chars": len(text),
         "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "preview": text[:80],
@@ -218,22 +260,79 @@ def entry(mid: int, text: str, *, ok: bool, mutual: bool, forced: bool,
         "forced": forced,
         "ok": ok,
         "code": code,
+        "reason": reason,
     }
 
 
+# ------------------------------------------------------------ durable reservation
+
+def reserve(mid: int, text: str, *, mutual: bool, forced: bool,
+            me_mid=None, name=None) -> dict:
+    """Cross-process atomic reservation: under the ledger lock, re-run every guard
+    against the on-disk ledger, then persist a PENDING attempt BEFORE the external
+    send. Returns the check summary. Raises DMPolicyError (guard/ledger) and writes
+    nothing in that case. If anything later fails, the pending row stays and keeps
+    counting toward quota — conservative by design."""
+    with _ledger_lock():
+        rows = load_ledger()
+        info = check(rows, mid, text, me_mid=me_mid)
+        rows.append(entry(mid, text, ok=None, kind="pending",
+                          mutual=mutual, forced=forced, me_mid=me_mid, name=name))
+        _write_json(LEDGER_FILE, rows[-LEDGER_MAX:])
+        return info
+
+
+def _finalize(mid, updates: dict) -> bool:
+    """Update the newest pending row for this recipient (still under the lock)."""
+    with _ledger_lock():
+        rows = load_ledger()
+        row = next((r for r in reversed(rows)
+                    if r.get("kind") == "pending" and str(r.get("mid")) == str(mid)), None)
+        if row is None:
+            return False
+        row.update(updates)
+        _write_json(LEDGER_FILE, rows[-LEDGER_MAX:])
+        return True
+
+
+def finalize_sent(mid: int, code=None) -> bool:
+    return _finalize(mid, {"kind": "sent", "ok": True, "code": code})
+
+
+def finalize_failed(mid: int, reason: str, code=None) -> bool:
+    """A send that reached the API but failed stays quota-bearing (kind=failed)."""
+    return _finalize(mid, {"kind": "failed", "ok": False, "reason": reason, "code": code})
+
+
+def record_refused(mid: int, text: str, *, reason: str, mutual=None,
+                   forced=False, me_mid=None, name=None) -> None:
+    """Audit-only refusal row: the send never left the machine, so it must not
+    consume quota — but the attempt is still ledgered, as the contract promises."""
+    record(entry(mid, text, ok=False, kind="refused", mutual=mutual, forced=forced,
+                 reason=reason, me_mid=me_mid, name=name))
+
+
 def status(now: float | None = None) -> dict:
-    """Today's budget and the last few entries — safe to call without --yes."""
+    """Today's budget and the last few entries — safe to call without --yes.
+    Degrades loudly (ledger_error field) instead of under-reporting quota."""
     now = time.time() if now is None else now
-    rows = load_ledger()
-    last24 = _recent(rows, now, 24)
-    return {
-        "sent_24h": len(last24),
+    out = {
         "cap_24h": DM_MAX_PER_DAY,
-        "remaining_24h": max(0, DM_MAX_PER_DAY - len(last24)),
         "cooldown_h": DM_COOLDOWN_H,
         "min_gap_s": DM_MIN_GAP_S,
         "max_chars": DM_MAX_CHARS,
+    }
+    try:
+        rows = load_ledger()
+    except DMLedgerError as e:
+        return {**out, "ledger_error": str(e), "sent_24h": None,
+                "remaining_24h": None, "recipients_24h": None, "recent": []}
+    last24 = [r for r in _recent(rows, now, 24) if r.get("kind") != "refused"]
+    return {
+        **out,
+        "sent_24h": len(last24),
+        "remaining_24h": max(0, DM_MAX_PER_DAY - len(last24)),
         "recipients_24h": sorted({r.get("mid") for r in last24}),
-        "recent": [{k: r.get(k) for k in ("at", "mid", "name", "ok", "chars", "preview")}
+        "recent": [{k: r.get(k) for k in ("at", "mid", "name", "kind", "ok", "chars", "preview")}
                    for r in rows[-5:]],
     }
