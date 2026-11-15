@@ -66,6 +66,85 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual(len(s.calls), 1)
         self.assertTrue(out.get("_cached"))
 
+    def test_distinct_params_kwarg_get_distinct_cache_entries(self):
+        """Regression (issue #9): query params travel via the requests params= kwarg,
+        never inside the URL — different bvids must not share one cache entry."""
+        base = "https://api.bilibili.com/x/web-interface/wbi/view"
+        body_a = {"code": 0, "data": {"aid": 1, "bvid": "BV1xx", "title": "video A"}}
+        body_b = {"code": 0, "data": {"aid": 2, "bvid": "BV1yy", "title": "video B"}}
+        s = FakeSession([FakeResponse(body_a), FakeResponse(body_b)])
+        out_a = traffic.guarded_get(s, base, params={"bvid": "BV1xx"})
+        out_b = traffic.guarded_get(s, base, params={"bvid": "BV1yy"})
+        # each call hit the network (no cross-bvid cache hit)
+        self.assertEqual(len(s.calls), 2)
+        self.assertEqual(out_a["data"]["aid"], 1)
+        self.assertEqual(out_b["data"]["aid"], 2)
+        self.assertFalse(out_a.get("_cached"))
+        self.assertFalse(out_b.get("_cached"))
+        # and now both are cached independently: repeat calls stay per-bvid correct
+        again_a = traffic.guarded_get(s, base, params={"bvid": "BV1xx"})
+        again_b = traffic.guarded_get(s, base, params={"bvid": "BV1yy"})
+        self.assertEqual(len(s.calls), 2)
+        self.assertEqual(again_a["data"]["aid"], 1)
+        self.assertEqual(again_b["data"]["aid"], 2)
+        self.assertTrue(again_a.get("_cached"))
+        self.assertTrue(again_b.get("_cached"))
+
+    def test_signed_params_kwarg_collides_with_unsigned(self):
+        """wts/w_rid inside the params kwarg are stripped: same call, one entry."""
+        base = "https://api.bilibili.com/x/web-interface/wbi/view"
+        s = FakeSession([FakeResponse(OK_VIEW)])
+        traffic.guarded_get(s, base, params={"bvid": "BV1xx"})
+        signed = traffic.guarded_get(
+            s, base, params={"bvid": "BV1xx", "wts": 1700000000, "w_rid": "abc123"})
+        self.assertEqual(len(s.calls), 1)
+        self.assertTrue(signed.get("_cached"))
+
+    def test_url_query_and_params_kwarg_merge_in_key(self):
+        """A param present in both URL query and kwarg is one key; different values differ."""
+        base = "https://api.bilibili.com/x/web-interface/view?bvid=BV1xx"
+        s = FakeSession([FakeResponse(OK_VIEW), FakeResponse(OK_VIEW)])
+        traffic.guarded_get(s, base, params={"bvid": "BV1xx"})
+        out = traffic.guarded_get(s, base, params={"bvid": "BV1xx", "other": "1"})
+        self.assertEqual(len(s.calls), 2)   # different merged query -> different entry
+        self.assertFalse(out.get("_cached"))
+
+    def test_cache_keys_include_sorted_query(self):
+        class S:
+            cookies = FakeCookies()
+        k = traffic._cache_key(
+            S(), "https://api.bilibili.com/x/web-interface/wbi/view",
+            params={"bvid": "BV1yy", "aid": "5"})
+        self.assertIn("aid=5&bvid=BV1yy", k)
+        self.assertNotIn("wts", k)
+
+    def test_api_level_two_bvids_no_cross_cache(self):
+        """Regression (issue #9), api layer: consecutive view calls for two bvids
+        return each video's own data (mock session, no network)."""
+        from bilicli.api import BiliAPI
+
+        api = BiliAPI.__new__(BiliAPI)          # skip __init__ (no creds/network)
+        api._wbi_key = "k" * 32                 # pre-seed: no nav fetch
+        api.csrf = ""
+        api.authed = False
+
+        vid_a = {"code": 0, "data": {"aid": 1, "bvid": "BV1xx", "cid": 111, "title": "A"}}
+        vid_b = {"code": 0, "data": {"aid": 2, "bvid": "BV1yy", "cid": 222, "title": "B"}}
+        s = FakeSession([FakeResponse(vid_a), FakeResponse(vid_b)])
+        api.s = s
+        with mock.patch("bilicli.api.BiliAPI._ensure_buvid"):
+            out_a = api.video("BV1xx")
+            out_b = api.video("BV1yy")
+        self.assertEqual(out_a["aid"], 1)
+        self.assertEqual(out_b["aid"], 2)
+        # the two requests went out with their own bvid params
+        self.assertEqual([c[1].get("params", {}).get("bvid") for c in s.calls],
+                         ["BV1xx", "BV1yy"])
+        # and a third call for the first bvid is a cache HIT with the first video's data
+        out_again = api.video("BV1xx")
+        self.assertEqual(len(s.calls), 2)
+        self.assertEqual(out_again["aid"], 1)
+
     def test_ttl_expiry_refetches(self):
         s = FakeSession([FakeResponse(OK_VIEW), FakeResponse(OK_VIEW)])
         traffic.guarded_get(s, VIEW_URL)
