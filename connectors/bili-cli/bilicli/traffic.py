@@ -3,7 +3,8 @@
 Ported from dsh-bili-whale tools/lib/bili-api.mjs (MIT, Alterssss) — the community-measured
 premise: bilibili 412/-412 rate-limits by IP, so hitting another endpoint never helps; the
 correct moves are cache what is static, back off when told to, and never fire requests
-back-to-back.  State lives beside the credentials (~/.bili-cli/, never in any repo):
+back-to-back.  State lives beside the credentials, in the connector state dir (never in any
+repo — `bili-cli home status` shows it):
 
   api-cache.json     24h metadata cache (view / acc info; 400 entries, LRU-trimmed)
   api-ban.json       streak-based exponential pause (5/10/20/30 min, 30 min cap)
@@ -217,7 +218,7 @@ def preflight(session, url: str, ttl_s: float = CACHE_TTL_S, params=None):
         mins = max(1, round((banned_until - time.time()) / 60))
         raise GuardBlocked(
             f"risk-control pause active ({ban_state().get('why')}) — about {mins} min left; "
-            "cached answers only until then (state: ~/.bili-cli/api-ban.json)")
+            f"cached answers only until then (state: {BAN_FILE})")
     hit = _cached(session, url, ttl_s, params)
     if hit is not None:
         _log_request(True, _cache_path(url) or url)

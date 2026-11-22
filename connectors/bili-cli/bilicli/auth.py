@@ -1,4 +1,8 @@
-"""Cookie import and loading: SESSDATA/bili_jct (+buvid3), stored 0600 in ~/.bili-cli/cookies.json.
+"""Cookie import and loading: SESSDATA/bili_jct (+buvid3), stored 0600 in the connector state dir.
+
+The connector state dir is the machine substrate home ``$OWFA_HOME/connectors/bili-cli/homes/<id>/``
+(``bili-cli home status`` shows it); the pre-0.4 ``~/.bili-cli`` is only the documented fallback
+that ``bili-cli home migrate`` moves out of.
 
 Three ways in:
   * `login --qrcode`  scan with the app (see qrlogin.py) — no copying
@@ -54,7 +58,8 @@ def load_cookies() -> dict:
     if not COOKIE_FILE.exists():
         raise SystemExit(
             "not logged in: run `bili-cli login --qrcode` (scan with the app) "
-            "or `bili-cli login --cookie '...'`; credentials stay in ~/.bili-cli/ only")
+            "or `bili-cli login --cookie '...'`; credentials stay in the local state dir only "
+            "(`bili-cli home status` shows it)")
     return json.loads(COOKIE_FILE.read_text(encoding="utf-8"))
 
 

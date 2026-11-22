@@ -13,7 +13,7 @@ The pet lives in the bili domain under a standing-consent contract (install = co
 
 1. `bili-pet status` — ledger intact (`ledger_corrupt: false`), shares cap > 0
 2. `wiki/bili/pet/persona.md` exists (create when absent — see below), `pet` block frontmatter present
-3. Materialize config: write `~/.bili-cli/pet.json` from the persona page's `pet` block mapping (owner/self/share/preferences/night/notify) — the page is the declaration, the JSON is the projection; refresh it every wake before acting
+3. Materialize config: write `pet.json` in the connector state dir (`bili-cli home status`) from the persona page's `pet` block mapping (owner/self/share/preferences/night/notify) — the page is the declaration, the JSON is the projection; refresh it every wake before acting
 4. `bili-cli me` answers (cookie alive); owner.mid set — without it the DM channel is closed (comment-@ still possible)
 
 ## The wake sequence (a cron-fired session arrives with zero priors — SASU-L)

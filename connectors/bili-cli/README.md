@@ -5,14 +5,14 @@ Connector for the wiki bilibili domain (web-cookie login state, homegrown lightw
 ## Discipline
 
 - **Read-mostly + write whitelist** (2026-10-06 owner decision): three low-risk items — watch-later add/remove, favorites add/remove, like; plus one restricted social write, `dm` (2026-10-29): mutual follow by default, 5 per rolling 24h, 1 per recipient/24h, 60 s gap, ≤450 chars, never to self, every attempt ledgered. All writes take a double gate — an explicit user verb (agent layer) + `--yes` (CLI layer); `dm` also wants `--dry` first. Everything else (coin/comment/share/follow/danmaku) is never provided, and raw does not carry writes
-- Credentials are browser cookies (SESSDATA / bili_jct = csrf): acquired by QR scan (`login --qrcode`, default) or pasted Cookie header (fallback); stored only on the local machine in `~/.bili-cli/cookies.json` (0600), never in any repo, never on screen, never echoed in full; rotation is persisted automatically
+- Credentials are browser cookies (SESSDATA / bili_jct = csrf): acquired by QR scan (`login --qrcode`, default) or pasted Cookie header (fallback); stored only on the local machine in the connector state dir — `$OWFA_HOME/connectors/bili-cli/homes/<id>/cookies.json` (`bili-cli home status`; `$OWFA_HOME` defaults to `~/.owfa`), 0600, never in any repo, never on screen, never echoed in full; rotation is persisted automatically
 - Personal data (watch history / favorites / watch-later) is instance data: relayed within the session only, never committed to any repo
 - **Request protection (0.3.0, ported from [dsh-bili-whale](https://github.com/Alterssss/dsh-bili-whale), MIT)**: every api.bilibili.com GET runs under a guard — 24h metadata cache, 300 ms in-process throttle, exponential 412/-412 breaker (5/10/20/30 min, stale cache serves where safe); on GuardBlocked stop and report, never endpoint-hop. Danmaku XML serves a sample (comparative counts only). Debrief materials land in `--out`; point instance-side runs at the instance tmp zone
 
 ## Usage
 
 ```
-bili-cli login --qrcode                        # scan with the bilibili app; no copy-paste (PNG at ~/.bili-cli/login-qr.png)
+bili-cli login --qrcode                        # scan with the bilibili app; no copy-paste (PNG in the connector state dir)
                                                #   --ascii/--no-ascii  terminal QR (default: only on a TTY)
                                                #   --no-png / --png PATH / --keep-qr
                                                #   --json-events      NDJSON progress on stderr
@@ -54,7 +54,7 @@ Output is always single-line JSON; timestamps are `YYYY-MM-DD HH:MM` local timez
 `login --qrcode` drives the web passport flow (`qrcode/generate` → poll every 2 s) and needs
 nothing but a phone:
 
-1. prints the QR twice — a PNG at `~/.bili-cli/login-qr.png` (0600, deleted on success) and,
+1. prints the QR twice — a PNG `login-qr.png` in the connector state dir (0600, deleted on success) and,
    when stderr is a TTY, an ASCII rendering for SSH/terminal work;
 2. reports state transitions `等待扫码` → `已扫码，请在手机上确认` → `登录成功`;
 3. regenerates the QR **once** automatically if it expires mid-wait;
@@ -68,7 +68,7 @@ For agent layers, `--json-events` replaces the human lines on stderr with one JS
 line — stable enough to parse:
 
 ```json
-{"event": "qr", "png": "/home/u/.bili-cli/login-qr.png", "expires_in": 180}
+{"event": "qr", "png": "/home/u/.owfa/connectors/bili-cli/homes/default/login-qr.png", "expires_in": 180}
 {"event": "state", "code": 86101, "label": "等待扫码"}
 {"event": "success", "mid": "503383791"}
 ```
@@ -84,11 +84,41 @@ line — stable enough to parse:
 | per recipient | 1 message / 24 h |
 | pacing | 60 s between any two sends |
 | length | 1–450 chars, never to yourself |
-| audit | every attempt (sent or refused) → `~/.bili-cli/dm-ledger.json` (0600), preview capped at 80 chars |
+| audit | every attempt (sent or refused) → `dm-ledger.json` in the connector state dir (0600), preview capped at 80 chars |
 
 Workflow: `--dry` prints the resolved recipient, relation attributes and the exact text; `--yes` sends.
 A refusal is an outcome — the CLI prints it and exits 1; do not retry, do not route around it through `raw`.
 `dm --status` is safe to call anytime and shows the remaining budget.
+
+## State and migration (machine substrate)
+
+bili-cli keeps no state in a repository. Credentials, the DM ledger, the request-guard state
+(`api-cache.json` / `api-ban.json` / `api-requests.log`) and the pet state live in the **connector
+state dir**, resolved at run time through the machine helper `.owfa/scripts/owfa_home.py`
+(ABI: `.owfa/docs/home.md`) rather than assembled by hand:
+
+```
+$OWFA_HOME/connectors/bili-cli/homes/<id>/        # default: $OWFA_HOME=~/.owfa, <id>=default
+```
+
+Resolution order:
+
+1. `BILI_CLI_HOME` — explicit override: use exactly this directory (compatibility escape hatch)
+2. the substrate helper — `resolve_home("bili-cli")`, the canonical default
+3. the pre-0.4 scattered home `~/.bili-cli` — only when no helper/workspace is found, or when the
+   substrate home does not exist yet and the old directory still holds state. This fallback is
+   **loud**: one stderr line names the migration command, and no second home is created silently.
+
+```
+bili-cli home status                  # read-only: source, state_dir, legacy presence, bindings + hazards
+bili-cli home migrate --dry-run       # show the planned move (entries, from -> to); changes nothing
+bili-cli home migrate                 # move ~/.bili-cli into the substrate, bind this root, leave a symlink
+```
+
+`home migrate` moves, never copies (the credential must exist once), leaves a symlink at the legacy
+path so old absolute references keep resolving, and refuses when `BILI_CLI_HOME` is set, when the
+legacy directory is absent, or when the target home already holds state. The move is the owner's
+cutover — never run it on a machine you do not own.
 
 ## Implementation notes
 
@@ -108,6 +138,7 @@ A refusal is an outcome — the CLI prints it and exits 1; do not retry, do not 
 
 ## Changelog
 
+- 0.6.0 2026-11-22: connector-home substrate — credentials/state resolve at run time through the machine helper `.owfa/scripts/owfa_home.py` into `$OWFA_HOME/connectors/bili-cli/homes/<id>/` instead of the scattered `~/.bili-cli`; new `home status` + `home migrate [--dry-run]` (explicit, move-never-copy, binds the root, leaves the legacy symlink); `BILI_CLI_HOME` explicit override; the legacy home stays a loud fallback with a stderr migration notice (never a silent second home); 18 new tests run the CLI against temp HOME/OWFA_HOME (the real homes are never touched), including the primary walk-up path with a helper planted inside a disposable workspace; declared `compat: ">= 0.5.2"` (the helper ABI this rides on)
 - 0.5.0 2026-10-29: restricted `dm` — recipient by mid or exact @nickname, mutual-follow default with an audited override, 5/24h + 1-per-recipient/24h + 60s gap + 450-char caps, `--dry` preview, `--status` budget view, append-only ledger (0600), 15 new tests; contract updated (write whitelist gains its fourth item, renamed from "low-risk" since admission now rests on caps + audit)
 - 0.4.0 2026-10-29: QR login — `login --qrcode` (passport generate/poll, transition-only progress, one automatic regeneration on expiry, `nav` verification before success), dual rendering (dependency-free PNG writer + TTY ASCII, optional `qr` extra), `--json-events` NDJSON contract, scriptable exit codes (0/1/2/130), consumed QR deleted from disk, `login` with no args = status, `logout`, and cookie rotation persistence (`persist_session`, atomic 0600 writes) so a live session keeps sliding instead of hard-expiring; 25 new tests (flow driven by a scripted fake session)
 - 0.3.0 2026-10-26: comprehension batch (bili-pet prework) — comments / thread (楼中楼) reads; debrief six-channel materials pipeline (cover, timed subtitles, danmaku hot zones with spam-wave filtering + subtitle alignment, hot comments, scene-snapped frame grids, hard-subtitle band collage; ported from dsh-bili-whale debrief.mjs/bili-watch.mjs, MIT); traffic request protection (cache/breaker/throttle, ported from its bili-api.mjs); unittest suite (31 cases, no network, no ffmpeg)

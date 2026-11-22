@@ -5,7 +5,8 @@ This is the *only* DM surface the connector offers, and the walls are code, not 
   * mutual follow required (override is explicit: --allow-non-mutual, and it is recorded)
   * 5 messages / rolling 24h, 1 per recipient / 24h, 60 s between any two sends
   * 450 characters max, no sending to yourself, no duplicate to the same recipient
-  * every attempt (sent or refused) lands in ~/.bili-cli/dm-ledger.json, 0600
+  * every attempt (sent or refused) lands in the connector state dir's dm-ledger.json
+    (0600; `bili-cli home status` shows the directory)
 
 The CLI adds the second gate: --yes. The agent layer adds the first: an explicit user verb.
 """

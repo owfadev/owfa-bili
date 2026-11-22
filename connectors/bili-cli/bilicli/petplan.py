@@ -8,8 +8,9 @@
   * "skip today" consumes a wake slot exactly like a wake does (a skip must not void
     the whole window — whale 2026-10-22 fix)
 
-The state file is executor-side (~/.bili-cli/pet/plan.json): the wiki cron task page
-records the INTENT (windows/skipChance), this engine rolls and persists the dice.
+The state file is executor-side (pet/plan.json in the connector state dir — `bili-cli home
+status`): the wiki cron task page records the INTENT (windows/skipChance), this engine
+rolls and persists the dice.
 """
 
 import random
