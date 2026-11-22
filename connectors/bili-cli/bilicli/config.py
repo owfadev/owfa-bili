@@ -2,9 +2,14 @@
 
 Endpoints are unofficial web-side APIs that bilibili may change at any time — measured behavior
 is authoritative; uncovered surfaces go through raw passthrough for probing.
+
+The credential/state directory is resolved at import time by ``bilicli.home`` through the
+machine substrate helper (``$OWFA_HOME/connectors/bili-cli/homes/<id>/``), with two explicit
+fallbacks: ``BILI_CLI_HOME`` wins outright, and a missing helper keeps the pre-0.4
+``~/.bili-cli`` with one stderr migration notice. Nothing here writes anything.
 """
 
-from pathlib import Path
+from .home import state_dir
 
 APP_URL = "https://www.bilibili.com"
 API_BASE = "https://api.bilibili.com"
@@ -13,8 +18,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# local credentials (0600, never in any repo, never on screen)
-CONFIG_DIR = Path.home() / ".bili-cli"
+# local credentials + mutable state (0600, never in any repo, never on screen).
+# CONFIG_DIR is the connector state dir: the machine substrate by default, the legacy
+# ~/.bili-cli only as the documented fallback (`bili-cli home status` explains which).
+CONFIG_DIR = state_dir()
 COOKIE_FILE = CONFIG_DIR / "cookies.json"
 
 # minimal cookie keys needed for login state; when buvid3 is absent it is fetched via the spi endpoint (risk-control baseline)

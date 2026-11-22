@@ -52,7 +52,8 @@ class BiliAPI:
         """Login gate for personal data and write commands; public queries (search/video/up/subtitle) are ungated."""
         if not self.authed:
             raise SystemExit(
-                f"{cmd} requires login state: run bili-cli login --cookie '...' first (credentials stay in ~/.bili-cli/ only)")
+                f"{cmd} requires login state: run bili-cli login --cookie '...' first (credentials stay in "
+                f"the local state dir only; `bili-cli home status` shows where)")
 
     # -- basics ---------------------------------------------------------
 

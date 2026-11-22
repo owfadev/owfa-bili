@@ -10,7 +10,7 @@ import json
 import sys
 import time
 
-from . import __version__, auth
+from . import __version__, auth, home
 from .api import BiliAPI
 
 
@@ -88,6 +88,18 @@ def cmd_login(args):
 
 def cmd_logout(args):
     _emit({"ok": True, "removed": auth.clear(), "stored": str(auth.COOKIE_FILE)})
+
+
+def cmd_home(args):
+    """Connector state location + the explicit pre-0.4 migration (never a side effect)."""
+    if args.action == "migrate":
+        try:
+            _emit(home.migrate(dry_run=args.dry_run, root=args.root))
+        except home.MigrationError as e:
+            _emit({"ok": False, "error": str(e)})
+            raise SystemExit(1)
+        return
+    _emit(home.status())
 
 
 def cmd_dm(args):
@@ -353,9 +365,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("login", help="QR scan (default path) or browser-cookie import; no args = status")
     s.add_argument("--qrcode", action="store_true",
-                   help="scan a QR with the bilibili app (writes a PNG to ~/.bili-cli/login-qr.png)")
+                   help="scan a QR with the bilibili app (writes a PNG into the connector state dir)")
     s.add_argument("--timeout", type=int, default=180, help="QR wait timeout in seconds (default 180)")
-    s.add_argument("--png", help="QR PNG path (default ~/.bili-cli/login-qr.png)")
+    s.add_argument("--png", help="QR PNG path (default: login-qr.png in the connector state dir)")
     s.add_argument("--no-png", action="store_true", help="do not write a PNG (terminal/ASCII only)")
     s.add_argument("--keep-qr", action="store_true", help="keep the QR PNG after a successful login")
     s.add_argument("--ascii", dest="ascii", action="store_true", default=None,
@@ -368,8 +380,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="or read a same-format string from a file")
     s.set_defaults(fn=cmd_login)
 
-    s = sub.add_parser("logout", help="delete the stored credential (~/.bili-cli/cookies.json)")
+    s = sub.add_parser("logout", help="delete the stored credential (cookies.json in the connector state dir)")
     s.set_defaults(fn=cmd_logout)
+
+    s = sub.add_parser("home", help="machine substrate: where state lives, and the explicit legacy migration")
+    s.add_argument("action", nargs="?", choices=["status", "migrate"], default="status",
+                   help="status = read-only view (default); migrate = move ~/.bili-cli into the substrate")
+    s.add_argument("--dry-run", action="store_true",
+                   help="migrate: print the planned move and change nothing")
+    s.add_argument("--root", default="",
+                   help="migrate: workspace root to bind (default: current directory)")
+    s.set_defaults(fn=cmd_home)
 
     s = sub.add_parser("dm", help="restricted direct message (mutual follow by default, capped, ledgered)")
     s.add_argument("--to", help="recipient: mid or @nickname")

@@ -1,9 +1,10 @@
 """bili-pet: the autonomous-agent write surface — policy gates + ledgered writes.
 
 Faithful port of dsh-bili-whale's policy layer (share-policy.mjs / quota.mjs / dm.mjs /
-comment.mjs, MIT, Alterssss), adapted to this connector's home: one credential store
-(~/.bili-cli/), JSON single-line output, and a standing-consent contract instead of a
-settings page.  Alignment decisions (whale's own, kept verbatim):
+comment.mjs, MIT, Alterssss), adapted to this connector's home: one credential store (the
+connector state dir — `bili-cli home status`), JSON single-line output, and a
+standing-consent contract instead of a settings page.  Alignment decisions (whale's own,
+kept verbatim):
 
   * hard caps are code, not knobs: shares <= shareDaily/day (default 3), one share per
     video per 7 days, replies at most once per person per 30 days (owner exempt)
@@ -16,9 +17,10 @@ settings page.  Alignment decisions (whale's own, kept verbatim):
   * DM hard limits (not overridable): owner mid only, mutual follow required, one
     recipient per day (unlimited messages to that one)
 
-Config lives in ~/.bili-cli/pet.json (owner/self/share/quota/preferences/night/notify);
-the wiki persona page is the declaration — the pet skill materializes this file from it.
-State lives in ~/.bili-cli/pet/ (quota.json / replied.json / dm-lock.json / feedback.json).
+Config lives in the connector state dir's pet.json (owner/self/share/quota/preferences/night/
+notify; `bili-cli home status`); the wiki persona page is the declaration — the pet skill
+materializes this file from it. State lives in pet/ under the same directory (quota.json /
+replied.json / dm-lock.json / feedback.json).
 """
 
 import json

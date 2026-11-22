@@ -16,10 +16,38 @@ Write: **whitelist only** — three low-risk items `watchlater add/remove`, `fav
 ## Prerequisites (install / auth)
 
 1. Install (if missing): `cd connectors/bili-cli` and install editable with the host's Python package manager (deps: requests only, plus the optional `qr` extra for QR rendering; e.g. `uv venv .venv && uv pip install -e ".[qr]"` on PEP 668 hosts — instance-level environment declarations in AGENTS.md take precedence; may also run from another venv with requests available via `PYTHONPATH=.`)
-2. Login — **QR first**: `bili-cli login --qrcode` writes `~/.bili-cli/login-qr.png` and polls. Show that PNG to the user and let them scan with the bilibili app + confirm; the command verifies `nav` and prints mid/uname. The QR lives ~3 min and the CLI already regenerates it once on expiry. Exit codes: 0 ok · 1 API failure · 2 expired/timeout (rerun) · 130 cancelled. Run it as a background job, wait for the PNG, then hand the path over; `--json-events` gives NDJSON progress instead of prose. Without the `qr` extra it still polls and prints the payload URL.
-3. Fallback login (no phone, borrowed profile): copy the browser Cookie header → `bili-cli login --cookie "SESSDATA=...; bili_jct=..."` (or `--file`). Stored at `~/.bili-cli/cookies.json` (0600) — credentials never enter any repo, never echoed in full.
+2. Login — **QR first**: `bili-cli login --qrcode` writes `login-qr.png` into the connector state dir (`bili-cli home status`; `$OWFA_HOME/connectors/bili-cli/homes/<id>/`, `$OWFA_HOME` defaults to `~/.owfa`) and polls. Show that PNG to the user and let them scan with the bilibili app + confirm; the command verifies `nav` and prints mid/uname. The QR lives ~3 min and the CLI already regenerates it once on expiry. Exit codes: 0 ok · 1 API failure · 2 expired/timeout (rerun) · 130 cancelled. Run it as a background job, wait for the PNG, then hand the path over; `--json-events` gives NDJSON progress instead of prose. Without the `qr` extra it still polls and prints the payload URL.
+3. Fallback login (no phone, borrowed profile): copy the browser Cookie header → `bili-cli login --cookie "SESSDATA=...; bili_jct=..."` (or `--file`). Stored as `cookies.json` in the connector state dir (0600) — credentials never enter any repo, never echoed in full.
+   The pre-0.4 home `~/.bili-cli` is **not** the target any more: when it still holds the state the CLI keeps using it, prints one stderr notice, and waits for the explicit `bili-cli home migrate` (see State below). Runtime override: `BILI_CLI_HOME=/path/to/dir` means "use exactly this directory".
 4. Self-check: `bili-cli login` (no args) reports `logged_in` + mid/uname; `bili-cli me` is the raw API check. Expiry shows as code -101 / anonymous `subtitle` output → `login --qrcode` again.
 5. Longevity: rotated `Set-Cookie` values are persisted after every command (`persist_session`), so a working login keeps sliding forward; `bili-cli logout` deletes the credential.
+
+## State (machine substrate)
+
+State belongs to the **machine**, not to one workspace: credentials, the DM ledger, the request guard
+state and the pet state all live in the connector state dir, resolved at run time through the machine
+helper (`.owfa/scripts/owfa_home.py`, ABI in `.owfa/docs/home.md`):
+
+```
+$OWFA_HOME/connectors/bili-cli/homes/<id>/     # default $OWFA_HOME=~/.owfa, <id>=default on a single workspace
+```
+
+Resolution order: `BILI_CLI_HOME` (explicit override) → the substrate helper → the pre-0.4 scattered
+home `~/.bili-cli`, which is only a **loud** fallback (one stderr line naming the migration command;
+the connector never silently creates a second home). `bili-cli login` and `logout` report the file as
+`stored`; `home status` reports the directory as `state_dir`.
+
+```
+bili-cli home status                  # where state lives: source, legacy presence, substrate bindings/hazards
+bili-cli home migrate --dry-run       # show the exact move; reads only, creates/moves nothing
+bili-cli home migrate                 # move ~/.bili-cli -> the substrate home and leave a symlink behind
+```
+
+Migration is **never** a side effect: only `home migrate` moves state, it moves (never copies) so the
+credential exists in one place, and it leaves a symlink at the legacy path so old absolute references
+keep resolving. The symlink is a human cleanup item — the connector never deletes it. Do not run
+`home migrate` on someone's machine as a reflex: on a shared machine it is the owner's cutover, and a
+set `BILI_CLI_HOME` makes the command refuse.
 
 ## Steps
 
@@ -43,6 +71,7 @@ Write: **whitelist only** — three low-risk items `watchlater add/remove`, `fav
 | One comment's floor replies (楼中楼) | `bili-cli thread <bvid> --root <rpid>` |
 | Six-channel comprehension materials | `bili-cli debrief <bvid> [--grid 3x3] [--no-frames] [--substrip N] [--out DIR]` (cover + subtitle file + danmaku hot zones aligned to the subtitle timeline + hot comments + frame grid; ffmpeg optional, frames skipped via `--no-frames`) |
 | Request-protection state | `bili-cli traffic` (risk-control breaker + cache at a glance) |
+| Connector state / legacy migration | `bili-cli home status` · `bili-cli home migrate --dry-run` → `bili-cli home migrate` |
 | UP info (+ recent uploads) | `bili-cli up <mid> [--arcs --limit 20]` |
 | Writes (whitelist, need `--yes` + explicit user verb) | `bili-cli watchlater add|remove <bvid> --yes` · `bili-cli fav add|remove <bvid> --fid <id> --yes` · `bili-cli fav move <bvid> --from <id> --to <id> --yes` · `bili-cli like <bvid> --yes` |
 | Restricted DM (caps in code) | `bili-cli dm --to <mid\|@昵称> --msg "..." --dry` (preview) → `--yes` (send) · `bili-cli dm --status` · `--allow-non-mutual` (recorded as forced) |
@@ -55,13 +84,13 @@ Timestamps are rendered `YYYY-MM-DD HH:MM` local time; durations are seconds (`d
 ## Restricted DM
 
 The one social write. Workflow: `dm --dry` → show the user the exact recipient + text → `dm --yes`.
-Caps are code, not prompts: mutual follow by default (`--allow-non-mutual` overrides and is recorded as `forced`), 5 messages per rolling 24 h, 1 per recipient per 24 h, 60 s between sends, ≤450 chars, never to yourself. Every attempt lands in `~/.bili-cli/dm-ledger.json` (0600). `dm --status` reads the budget and is safe anytime.
+Caps are code, not prompts: mutual follow by default (`--allow-non-mutual` overrides and is recorded as `forced`), 5 messages per rolling 24 h, 1 per recipient per 24 h, 60 s between sends, ≤450 chars, never to yourself. Every attempt lands in `dm-ledger.json` in the connector state dir (0600). `dm --status` reads the budget and is safe anytime.
 A refusal is an outcome: report the `[dm]` line verbatim and stop — never retry, never route around it via `raw`.
 
 ## Known limits
 
 - Unofficial web API: endpoints and the WBI signing scheme can change without notice; on breakage use `raw` against the browser-observed URL to re-derive, then fix `config.py` endpoint table
-- **Request protection (0.3.0)**: all api.bilibili.com GETs run under a guard — 24h metadata cache (`view` / `acc info`; nav 10 min), 300 ms in-process throttle, and an exponential risk-control breaker (HTTP 412/429 or code -412/-352/... → pause 5/10/20/30 min, stale cache serves where safe). On `GuardBlocked` errors: stop, report the pause, do NOT retry or endpoint-hop. `BILI_NO_CACHE=1` bypasses cache+breaker (debug only). State files live in `~/.bili-cli/` (`api-cache.json` / `api-ban.json` / `api-requests.log`)
+- **Request protection (0.3.0)**: all api.bilibili.com GETs run under a guard — 24h metadata cache (`view` / `acc info`; nav 10 min), 300 ms in-process throttle, and an exponential risk-control breaker (HTTP 412/429 or code -412/-352/... → pause 5/10/20/30 min, stale cache serves where safe). On `GuardBlocked` errors: stop, report the pause, do NOT retry or endpoint-hop. `BILI_NO_CACHE=1` bypasses cache+breaker (debug only). State files live in the connector state dir (`api-cache.json` / `api-ban.json` / `api-requests.log`)
 - The danmaku XML endpoint serves a **sample** of the full barrage (measured ~1/4 on a mid-size video) — counts are comparative (bucket vs bucket), never absolute; `debrief` reports the ratio
 - `debrief` frame channel needs ffmpeg + login-gated playurl (plain 720p mp4 via `platform=pc&fnval=1`); without ffmpeg use `--no-frames`, with a dash-only video the channel reports the error and the other five still deliver
 - Debrief materials (cover / subtitle.txt / frame sheets / the mp4 itself) land in the `--out` directory — instance discipline: point it at the instance tmp zone, never `vault/` or tracked paths; the manifest JSON is the only thing worth relaying verbatim
