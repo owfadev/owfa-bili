@@ -14,6 +14,10 @@ cutover recipe; the connector exposes it through explicit commands, never as a s
 | explicit override | none | `BILI_CLI_HOME=/path/to/dir` |
 | old path | the only path | loud fallback only (one stderr line), plus `home migrate` |
 
+Requires framework 0.5.2+ (the `.owfa/scripts/owfa_home.py` connector-home ABI this
+release rides on; the package `compat` floor is `>= 0.5.2`). Without the helper the
+connector keeps working on the loud legacy fallback but `home migrate` fails closed.
+
 Everything inside the directory moves together and stays 0600/0700: `cookies.json`,
 `dm-ledger.json`, `dm-device-id`, `api-cache.json`, `api-ban.json`, `api-requests.log`,
 `login-qr.png`, `pet.json`, `pet/` (`quota.json`, `replied.json`, `dm-lock.json`,
@@ -41,6 +45,17 @@ python3 .owfa/scripts/owfa_home.py migrate bili-cli --legacy ~/.bili-cli
 - Do not migrate twice: the second run reports `already_migrated`.
 - `home migrate` refuses when `BILI_CLI_HOME` is set, when there is no legacy directory,
   or when the target home already holds state — resolve those by hand.
-- Multiple workspaces: the first `home migrate` binds the workspace it is run from; bind
-  further roots via `bili-cli home migrate --root <ws>` (same machine, one home per
-  binding — two workspaces must not drain one spool).
+- Run this from the **workspace root**. In an unbound workspace `home migrate` binds the
+  current directory, so starting it from a subdirectory binds that subdirectory as the
+  root. `cd` to the workspace root first (or, on that first run, pass
+  `--root <workspace>` if you deliberately want another anchor).
+- Multiple workspaces: `home migrate` is a one-shot operation — the first run binds the
+  workspace it is run from, and once the legacy path is a symlink a second run returns
+  `already_migrated` and binds nothing (by design; it never re-targets). Bind another root
+  explicitly through the helper:
+
+  ```bash
+  python3 .owfa/scripts/owfa_home.py bind bili-cli --root <ws>
+  ```
+
+  One home per binding — two workspaces must not drain one spool.
